@@ -72,14 +72,18 @@ st.markdown("""
 # Configuration
 # ─────────────────────────────────────────────
 CONFIG = {
-    "timeout_navigation": 45_000,
-    "timeout_element":    15_000,
+    # Streamlit Cloud runs on shared infra — cold starts, slower network,
+    # and BSE/NSE do geo-throttling on cloud IPs. Generous timeouts needed.
+    "timeout_navigation": 90_000,   # was 45s — cloud needs 90s
+    "timeout_element":    30_000,   # was 15s — BSE AJAX is slow on cloud
+    "timeout_pdf_link":   20_000,   # new — for PDF link selectors
     "user_agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/121.0.0.0 Safari/537.36"
     ),
-    "delay_between_companies": 2,
+    "delay_between_companies": 3,   # slightly more breathing room
+    "requests_timeout": 90,         # was 60s
 }
 
 # ─────────────────────────────────────────────
@@ -101,7 +105,7 @@ def download_bytes(url: str, exchange: str = "") -> bytes | None:
     elif "bseindia" in url:
         headers["Referer"] = "https://www.bseindia.com/"
     try:
-        r = requests.get(url, headers=headers, allow_redirects=True, timeout=60)
+        r = requests.get(url, headers=headers, allow_redirects=True, timeout=CONFIG["requests_timeout"])
         r.raise_for_status()
         return r.content
     except Exception:
@@ -130,7 +134,8 @@ def bse_discover(company_input: str, logs: list):
         page    = context.new_page()
         try:
             page.goto("https://www.bseindia.com/getquote.aspx",
-                      wait_until="networkidle", timeout=CONFIG["timeout_navigation"])
+                      wait_until="domcontentloaded", timeout=CONFIG["timeout_navigation"])
+            # networkidle hangs on cloud — wait for the search box directly instead
 
             search_sel     = "input#ContentPlaceHolder1_SmartSearch_smartSearch"
             suggestion_sel = "#ajax_response_smart li a"
@@ -155,7 +160,7 @@ def bse_discover(company_input: str, logs: list):
                 pass
 
             page.keyboard.press("Enter")
-            page.wait_for_load_state("networkidle", timeout=CONFIG["timeout_navigation"])
+            page.wait_for_load_state("domcontentloaded", timeout=CONFIG["timeout_navigation"])
             m = re.search(r'/stock-share-price/([^/]+)/([^/]+)/(\d+)/', page.url)
             if m:
                 browser.close()
@@ -172,7 +177,7 @@ def bse_extract_reports(page) -> list:
     reports = []
     try:
         try:
-            page.wait_for_selector("td:has-text('Year')", timeout=10_000)
+            page.wait_for_selector("td:has-text('Year')", timeout=CONFIG["timeout_element"])
         except Exception:
             page.wait_for_selector("table", timeout=5_000)
 
@@ -218,7 +223,7 @@ def handle_bse(company: str, year: int, logs: list) -> dict | None:
         page    = browser.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=CONFIG["timeout_navigation"])
-            time.sleep(2)
+            time.sleep(4)  # BSE lazy-loads the reports table via JS
             reports = bse_extract_reports(page)
 
             target_str   = str(year)
@@ -274,7 +279,7 @@ def nse_extract_reports(page, year: int) -> list:
     pattern = f"{year}-{short}"
     reports = []
     try:
-        page.wait_for_selector("a[href$='.pdf'], a[href$='.zip']", timeout=15_000)
+        page.wait_for_selector("a[href$='.pdf'], a[href$='.zip']", timeout=CONFIG["timeout_pdf_link"])
         for link in page.locator("a[href$='.pdf'], a[href$='.zip']").all():
             href = link.get_attribute("href") or ""
             text = link.text_content() or ""
@@ -303,10 +308,12 @@ def handle_nse(company: str, year: int, logs: list) -> dict | None:
         context = browser.new_context(user_agent=CONFIG["user_agent"])
         page    = context.new_page()
         try:
-            page.goto("https://www.nseindia.com", wait_until="networkidle",
+            # NSE uses heavy JS — networkidle never fires on cloud infra
+            page.goto("https://www.nseindia.com", wait_until="domcontentloaded",
                       timeout=CONFIG["timeout_navigation"])
-            page.goto(url, wait_until="networkidle", timeout=CONFIG["timeout_navigation"])
-            time.sleep(3)
+            time.sleep(4)  # let NSE cookies/JS settle
+            page.goto(url, wait_until="domcontentloaded", timeout=CONFIG["timeout_navigation"])
+            time.sleep(5)  # NSE renders reports table via XHR after load
 
             reports = nse_extract_reports(page, year)
             if reports:
@@ -332,17 +339,44 @@ def handle_nse(company: str, year: int, logs: list) -> dict | None:
 # ─────────────────────────────────────────────
 # Core runner — plain for-loop, zero asyncio
 # ─────────────────────────────────────────────
+def _run_with_retry(fn, company, year, logs, retries=2):
+    """
+    Retry wrapper for BSE/NSE handlers.
+    Streamlit Cloud: first attempt may hit a cold network or
+    a transient BSE/NSE timeout — one retry usually succeeds.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            result = fn(company, year, logs)
+            if result:
+                return result
+            if attempt < retries:
+                log(f"   ↩ No result on attempt {attempt}, retrying...", logs)
+                time.sleep(4)
+        except Exception as e:
+            err = str(e)
+            if "Timeout" in err or "timeout" in err:
+                log(f"   ⚠ Timeout on attempt {attempt}: {err[:120]}", logs)
+                if attempt < retries:
+                    log(f"   ↩ Retrying in 5s...", logs)
+                    time.sleep(5)
+            else:
+                log(f"   ❌ Unexpected error: {err[:200]}", logs)
+                break
+    return None
+
+
 def run_downloads(companies: list, year: int, exchange: str, logs: list) -> list:
     results = []
     for company in companies:
         log(f"\n{'─'*50}", logs)
         log(f"Processing: {company}", logs)
         if exchange in ("BSE", "BOTH"):
-            res = handle_bse(company, year, logs)
+            res = _run_with_retry(handle_bse, company, year, logs)
             if res:
                 results.append(res)
         if exchange in ("NSE", "BOTH"):
-            res = handle_nse(company, year, logs)
+            res = _run_with_retry(handle_nse, company, year, logs)
             if res:
                 results.append(res)
         time.sleep(CONFIG["delay_between_companies"])
@@ -394,6 +428,16 @@ with col_right:
     exchange = st.radio("Exchange", ["BSE", "NSE", "BOTH"], horizontal=True)
 
 st.divider()
+
+# ── Environment-aware timing note ──────────────────────────────
+is_cloud = not platform.system() == "Windows"
+if is_cloud:
+    st.info(
+        "⏱ **Running on Streamlit Cloud?** BSE/NSE impose geo-throttling on "
+        "cloud IPs and their pages use heavy JS. Each company may take "
+        "60–90 seconds. Batch of 3+ companies can take 5+ minutes — this is normal.",
+        icon="ℹ️"
+    )
 
 if st.button("🚀 Fetch Reports", type="primary",
              disabled=(len(companies) == 0), use_container_width=True):
