@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Playwright browser cache
+ms-playwright/
+
+# Downloaded PDFs / ZIPs (do not commit reports)
+*.pdf
+*.zip
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Streamlit secrets (keep this out of source control!)
+.streamlit/secrets.toml
