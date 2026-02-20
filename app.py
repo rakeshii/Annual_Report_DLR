@@ -100,91 +100,326 @@ def fetch_bytes(url: str, headers: dict) -> bytes | None:
 #   Search : GET https://api.bseindia.com/BseIndiaAPI/api/fetchcomp/w?search={query}
 #   Reports: GET https://api.bseindia.com/BseIndiaAPI/api/AnnualReport/w?scripcode={code}
 # ══════════════════════════════════════════════════════════════
-def bse_search_company(query: str, logs: list) -> tuple[str, str] | tuple[None, None]:
-    """Returns (scrip_code, company_name) or (None, None)."""
-    # If user pasted a BSE URL, extract code directly
-    if "bseindia.com" in query:
-        m = re.search(r'/(\d{6})/', query)
-        if m:
-            return m.group(1), query
-    # If raw 6-digit code
-    if query.strip().isdigit() and len(query.strip()) == 6:
-        return query.strip(), query.strip()
+def _bse_extract_code_name(item: dict, query: str) -> tuple[str, str] | tuple[None, None]:
+    code = str(
+        item.get("SCRIP_CD")      or item.get("SECURITY_CODE") or
+        item.get("scripcode")     or item.get("Scrip_Code")    or
+        item.get("scrip_cd")      or item.get("Scripcode")     or
+        item.get("ScripCode")     or ""
+    ).strip()
+    name = (
+        item.get("Scrip_Name")    or item.get("SECURITY_NAME") or
+        item.get("Issuer_Name")   or item.get("long_name")     or
+        item.get("SCRIP_NAME")    or item.get("scrip_name")    or
+        item.get("ScripName")     or query
+    )
+    return (code, str(name)) if code else (None, None)
 
-    log(f"[BSE] Searching: '{query}'", logs)
-    url  = f"https://api.bseindia.com/BseIndiaAPI/api/fetchcomp/w?search={requests.utils.quote(query)}"
-    data = fetch_json(url, BSE_HEADERS)
 
-    # Response is a list of dicts with keys: SECURITY_CODE, SECURITY_NAME, ...
-    if isinstance(data, list) and data:
-        first = data[0]
-        code  = str(first.get("SECURITY_CODE", "")).strip()
-        name  = first.get("SECURITY_NAME") or first.get("Issuer_Name") or query
-        if code:
-            log(f"[BSE] Found: {name} ({code})", logs)
-            return code, name
+# ── BSE Equity Master (cached per session) ───────────────────
+# BSE publishes a full CSV of all listed equities — no auth needed.
+# We download it once, parse into a lookup dict, reuse for all searches.
+_BSE_MASTER: dict | None = None   # {name_lower: (code, name), isin: (code, name)}
 
-    # Fallback — try alternate endpoint
-    url2  = f"https://api.bseindia.com/BseIndiaAPI/api/GetCompanyList/w?search={requests.utils.quote(query)}"
-    data2 = fetch_json(url2, BSE_HEADERS)
-    if isinstance(data2, list) and data2:
-        first = data2[0]
-        code  = str(first.get("scripcode") or first.get("SCRIP_CD") or "").strip()
-        name  = first.get("long_name") or first.get("SCRIP_NAME") or query
-        if code:
-            log(f"[BSE] Found (alt): {name} ({code})", logs)
-            return code, name
+def _load_bse_master(logs: list) -> dict:
+    global _BSE_MASTER
+    if _BSE_MASTER is not None:
+        return _BSE_MASTER
 
-    log(f"[BSE] ❌ Company not found: '{query}'", logs)
+    log("[BSE] Loading equity master list...", logs)
+    _BSE_MASTER = {}
+
+    # BSE equity master CSV — publicly available, updated daily
+    urls = [
+        "https://www.bseindia.com/corporates/List_Scrips.aspx",   # HTML but has data
+        "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w?segment=equity&status=Active",
+    ]
+
+    # Primary: direct CSV download
+    csv_url = "https://www.bseindia.com/downloads/BseIndiaAPI/ListofScrips.csv"
+    try:
+        r = requests.get(csv_url, headers=BSE_HEADERS, timeout=30)
+        if r.status_code == 200 and "," in r.text[:100]:
+            import csv, io
+            reader = csv.DictReader(io.StringIO(r.text))
+            for row in reader:
+                code = str(row.get("Security Code") or row.get("Scrip Code") or "").strip()
+                name = str(row.get("Security Name") or row.get("Scrip Name") or "").strip()
+                isin = str(row.get("ISIN No") or row.get("ISIN") or "").strip()
+                if code and name:
+                    _BSE_MASTER[name.lower()] = (code, name)
+                    if isin:
+                        _BSE_MASTER[isin.upper()] = (code, name)
+            log(f"[BSE] Master loaded: {len(_BSE_MASTER)} entries from CSV", logs)
+            return _BSE_MASTER
+    except Exception as e:
+        log(f"[BSE-DEBUG] CSV load failed: {e}", logs)
+
+    # Fallback: JSON API
+    try:
+        session = bse_make_session()
+        data = fetch_json(
+            "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w?segment=equity&status=Active",
+            BSE_HEADERS, session
+        )
+        if isinstance(data, list) and data:
+            log(f"[BSE-DEBUG] Master JSON keys: {list(data[0].keys())}", logs)
+            for item in data:
+                code, name = _bse_extract_code_name(item, "")
+                isin = str(
+                    item.get("ISIN_NUMBER") or item.get("isin_code") or
+                    item.get("ISIN_CODE")   or item.get("isin")      or ""
+                ).strip()
+                if code and name:
+                    _BSE_MASTER[name.lower()] = (code, name)
+                    if isin:
+                        _BSE_MASTER[isin.upper()] = (code, name)
+            log(f"[BSE] Master loaded: {len(_BSE_MASTER)} entries from JSON", logs)
+    except Exception as e:
+        log(f"[BSE-DEBUG] JSON master failed: {e}", logs)
+
+    return _BSE_MASTER
+
+
+def _search_bse_master(query: str, logs: list) -> tuple[str, str] | tuple[None, None]:
+    """Fuzzy search BSE master list by name or ISIN."""
+    master = _load_bse_master(logs)
+    if not master:
+        return None, None
+
+    q = query.strip().upper()
+
+    # Exact ISIN match
+    if q in master:
+        return master[q]
+
+    # Exact name match (case-insensitive)
+    q_lower = query.strip().lower()
+    if q_lower in master:
+        return master[q_lower]
+
+    # Strip common suffixes and try again
+    stripped = re.sub(
+        r"(ltd\.?|limited|inc\.?|corp\.?|pvt\.?|llp|industries|company|enterprises|solutions)",
+        "", q_lower, flags=re.I
+    ).strip()
+
+    # Substring match — find all names containing the query
+    matches = [
+        (k, v) for k, v in master.items()
+        if len(k) > 4 and (stripped in k or q_lower in k)
+        and not k.startswith("IN")   # skip ISIN keys
+    ]
+    if matches:
+        # Prefer shorter names (more exact match)
+        matches.sort(key=lambda x: len(x[0]))
+        best_k, best_v = matches[0]
+        log(f"[BSE] Master match: '{best_k}' → {best_v}", logs)
+        return best_v
+
+    # Word-by-word: any key that starts with the first word of query
+    first_word = (stripped or q_lower).split()[0]
+    if len(first_word) >= 3:
+        starts = [
+            (k, v) for k, v in master.items()
+            if k.startswith(first_word) and not k.startswith("IN")
+        ]
+        if starts:
+            starts.sort(key=lambda x: len(x[0]))
+            best_k, best_v = starts[0]
+            log(f"[BSE] Master prefix match: '{best_k}' → {best_v}", logs)
+            return best_v
+
     return None, None
 
 
-def bse_get_report_url(scrip_code: str, year: int, logs: list) -> str | None:
-    """Fetch annual report list and return PDF URL matching target year."""
-    log(f"[BSE] Fetching report list for {scrip_code}...", logs)
-    url  = f"https://api.bseindia.com/BseIndiaAPI/api/AnnualReport/w?scripcode={scrip_code}"
-    data = fetch_json(url, BSE_HEADERS)
+def bse_search_company(query: str, logs: list) -> tuple[str, str] | tuple[None, None]:
+    """
+    Returns (scrip_code, company_name).
+    Strategy:
+      1. Direct 6-digit code or BSE URL          — instant
+      2. NSE cross-lookup via ISIN               — works reliably
+      3. BSE equity master CSV/JSON fuzzy search — offline, no API needed
+    """
+    # ── Strategy 1: direct ────────────────────────────────────────
+    if "bseindia.com" in query:
+        m = re.search(r"/(\d{6})/", query)
+        if m:
+            return m.group(1), query
+    if re.fullmatch(r"\d{6}", query.strip()):
+        return query.strip(), query.strip()
 
-    if not isinstance(data, list) or not data:
-        # Try alternate report endpoint
-        url2 = f"https://api.bseindia.com/BseIndiaAPI/api/AnnRptList/w?scripcode={scrip_code}&type=C"
-        data = fetch_json(url2, BSE_HEADERS)
+    log(f"[BSE] Searching: '{query}'", logs)
 
-    if not isinstance(data, list):
-        log(f"[BSE] ❌ No report list returned", logs)
+    # ── Strategy 2: NSE → ISIN → BSE master lookup ────────────────
+    # NSE search returns ISIN; we use that to find BSE scrip code
+    try:
+        keyword     = query.split()[0]
+        nse_session = nse_make_session()
+        nse_url     = f"https://www.nseindia.com/api/search/autocomplete?q={requests.utils.quote(keyword)}"
+        nse_data    = fetch_json(nse_url, NSE_HEADERS, nse_session)
+        nse_results = (
+            nse_data if isinstance(nse_data, list)
+            else (nse_data.get("symbols") or nse_data.get("data") or [])
+            if isinstance(nse_data, dict) else []
+        )
+
+        # Pre-load BSE master ONCE before looping NSE results
+        # so ISIN lookup works on first hit
+        _load_bse_master(logs)
+
+        for hit in nse_results[:5]:
+            symbol = hit.get("symbol") or ""
+            if not symbol:
+                continue
+            info_url = f"https://www.nseindia.com/api/quote-equity?symbol={requests.utils.quote(symbol)}"
+            info     = fetch_json(info_url, NSE_HEADERS, nse_session)
+            if not isinstance(info, dict):
+                continue
+            isin = (
+                info.get("metadata", {}).get("isin") or
+                info.get("info", {}).get("isin")     or
+                info.get("securityInfo", {}).get("isin") or ""
+            )
+            co_name = (
+                info.get("info", {}).get("companyName") or
+                info.get("metadata", {}).get("companyName") or symbol
+            )
+            log(f"[BSE] NSE hit: {co_name} | ISIN: {isin}", logs)
+            if isin and _BSE_MASTER:
+                # Direct ISIN lookup — exact match, no fuzzy
+                result = _BSE_MASTER.get(isin.upper())
+                if result:
+                    code, name = result
+                    log(f"[BSE] ✅ Resolved via ISIN {isin}: {name} ({code})", logs)
+                    return code, name
+    except Exception as e:
+        log(f"[BSE-DEBUG] NSE cross-lookup error: {e}", logs)
+
+    # ── Strategy 3: BSE master fuzzy search ───────────────────────
+    code, name = _search_bse_master(query, logs)
+    if code:
+        log(f"[BSE] Found via master: {name} ({code})", logs)
+        return code, name
+
+    log(f"[BSE] ❌ Not found.", logs)
+    log(f"[BSE] 💡 Enter the 6-digit scrip code directly (BEL = 500049)", logs)
+    return None, None
+
+
+def bse_get_report_url(scrip_code: str, year: int, logs: list, session=None) -> str | None:
+    """Fetch annual report list and return PDF URL for target year."""
+    if session is None:
+        session = bse_make_session()
+
+    log(f"[BSE] Fetching report list for scrip {scrip_code}...", logs)
+
+    endpoints = [
+        f"https://api.bseindia.com/BseIndiaAPI/api/AnnualReport/w?scripcode={scrip_code}",
+        f"https://api.bseindia.com/BseIndiaAPI/api/AnnRptList/w?scripcode={scrip_code}&type=C",
+        f"https://api.bseindia.com/BseIndiaAPI/api/AnnualReportNew/w?scripcode={scrip_code}",
+    ]
+
+    data = None
+    for url in endpoints:
+        data = fetch_json(url, BSE_HEADERS, session)
+        if isinstance(data, list) and data:
+            log(f"[BSE-DEBUG] Report endpoint worked: {url.split('api/')[-1]}", logs)
+            break
+        elif isinstance(data, dict):
+            # Unwrap nested structure
+            data = (data.get("Table") or data.get("data") or
+                    data.get("AnnualReportList") or data.get("reports") or [])
+            if data:
+                log(f"[BSE-DEBUG] Unwrapped dict from endpoint", logs)
+                break
+        data = None
+
+    if not data:
+        log(f"[BSE] ❌ No report list returned for {scrip_code}", logs)
+        log(f"[BSE] 💡 Verify scrip code at bseindia.com/stock-share-price/.../XXXXXX/", logs)
         return None
 
+    # Show available entries for debug
+    if data:
+        log(f"[BSE-DEBUG] Report keys: {list(data[0].keys())}", logs)
+        # Show actual year values using confirmed field name 'year'
+        all_vals = [
+            str(item.get("year") or item.get("PERIOD") or item.get("YEAR") or
+                item.get("TO_PERIOD") or item.get("toDate") or "?")
+            for item in data[:8]
+        ]
+        log(f"[BSE-DEBUG] Periods found: {all_vals}", logs)
+
     target_str   = str(year)
-    target_short = target_str[-2:]          # "24" for 2024
+    target_short = target_str[-2:]      # "24" for 2024
 
     for item in data:
-        # Fields vary: PERIOD, YEAR, PERIOD_END, FILENAME, PDFNAME, ...
+        # Read period using confirmed field 'year' first, then fallbacks
         period = str(
-            item.get("PERIOD") or item.get("YEAR") or
-            item.get("PERIOD_END") or item.get("year") or ""
+            item.get("year")      or item.get("PERIOD")    or
+            item.get("YEAR")      or item.get("TO_PERIOD") or
+            item.get("toDate")    or item.get("FromDate")  or ""
         )
-        pdf_field = (
-            item.get("FILENAME") or item.get("PDFNAME") or
-            item.get("DOCUMENT_NAME") or item.get("PDF_LINK") or ""
-        )
+        # Also scan all values as safety net
+        all_text = period + " " + " ".join(str(v) for v in item.values())
 
-        period_l = period.lower()
-        if target_str in period_l or f"-{target_short}" in period_l or f"/{target_short}" in period_l:
-            # Build full URL if relative
-            if pdf_field:
-                if pdf_field.startswith("http"):
-                    return pdf_field
-                # Common BSE PDF paths
-                for base in [
-                    "https://www.bseindia.com/xml-data/corpfiling/AttachHis/",
-                    "https://www.bseindia.com/AnnualReports/",
-                    "https://www.bseindia.com/",
-                ]:
-                    candidate = base + pdf_field
-                    log(f"[BSE] Candidate URL: {candidate}", logs)
+        if target_str not in all_text and f"-{target_short}" not in all_text:
+            continue
+
+        # Extract PDF using confirmed field 'file_name' first
+        pdf = str(
+            item.get("file_name")       or item.get("FILENAME")      or
+            item.get("fileName")        or item.get("PDFNAME")       or
+            item.get("DOCUMENT_NAME")   or item.get("PDF_LINK")      or
+            item.get("ATTACHMENTNAME")  or item.get("FILECODE")      or
+            item.get("FileNm")          or item.get("STRFILEPATH")   or
+            item.get("FILEPATH")        or item.get("FileName")      or ""
+        ).strip()
+
+        # Strip accidental double extension (.pdf.pdf)
+        if pdf.endswith(".pdf.pdf"):
+            pdf = pdf[:-4]
+
+        log(f"[BSE] Year '{period}' matched. pdf='{pdf[:80]}'", logs)
+
+        if not pdf:
+            log(f"[BSE-DEBUG] No PDF field. Item: {dict(list(item.items()))}", logs)
+            continue
+
+        if pdf.startswith("http"):
+            return pdf
+
+        # BSE GUID-style filenames (uuid.pdf) go to /AttachHis/
+        # Older named files may be in /AnnualReports/
+        is_guid = bool(re.match(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            pdf, re.I
+        ))
+        bases = (
+            ["https://www.bseindia.com/xml-data/corpfiling/AttachHis/"]
+            if is_guid else [
+                "https://www.bseindia.com/xml-data/corpfiling/AttachHis/",
+                "https://www.bseindia.com/AnnualReports/",
+                "https://www.bseindia.com/bseplus/AnnualReport/",
+            ]
+        )
+        for base in bases:
+            candidate = base + pdf
+            try:
+                hr = requests.head(candidate, headers=BSE_HEADERS, timeout=8, allow_redirects=True)
+                if hr.status_code < 400:
+                    log(f"[BSE] ✅ URL confirmed: {candidate}", logs)
                     return candidate
+            except Exception:
+                pass
 
-    log(f"[BSE] ❌ No report found for year {year} (checked {len(data)} entries)", logs)
+        # Return best guess if HEAD checks fail (firewalls sometimes block HEAD)
+        best = bases[0] + pdf
+        log(f"[BSE] Returning best-guess URL: {best}", logs)
+        return best
+
+    log(f"[BSE] ❌ No report matched year {year} in {len(data)} entries", logs)
     return None
 
 
@@ -193,7 +428,9 @@ def handle_bse(company: str, year: int, logs: list) -> dict | None:
     if not code:
         return None
 
-    pdf_url = bse_get_report_url(code, year, logs)
+    # Reuse a fresh session with cookies for report fetch too
+    session = bse_make_session()
+    pdf_url = bse_get_report_url(code, year, logs, session)
     if not pdf_url:
         return None
 
@@ -227,6 +464,19 @@ def nse_make_session() -> requests.Session:
     s = requests.Session()
     try:
         s.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=TIMEOUT)
+    except Exception:
+        pass
+    return s
+
+
+def bse_make_session() -> requests.Session:
+    """Hit BSE homepage first — BSE API returns empty without session cookies."""
+    s = requests.Session()
+    try:
+        s.get("https://www.bseindia.com", headers=BSE_HEADERS, timeout=TIMEOUT)
+        # Also hit the quotes page — this sets additional required cookies
+        s.get("https://www.bseindia.com/markets/equity/EQReports/MarketWatch.aspx",
+              headers=BSE_HEADERS, timeout=TIMEOUT)
     except Exception:
         pass
     return s
@@ -268,30 +518,39 @@ def nse_get_report_url(symbol: str, year: int, session: requests.Session, logs: 
         data = fetch_json(url2, NSE_HEADERS, session)
 
     if not isinstance(data, list) and isinstance(data, dict):
-        data = data.get("data") or data.get("reports") or []
+        log(f"[NSE-DEBUG] Response dict keys: {list(data.keys())}", logs)
+        data = data.get("data") or data.get("reports") or data.get("annualReports") or []
 
     if not isinstance(data, list) or not data:
-        log(f"[NSE] ❌ No report list returned", logs)
+        log(f"[NSE] ❌ No report list returned (got {type(data).__name__})", logs)
         return None
 
-    # NSE year format: "2023-24" for FY starting 2023
-    target_short = str(year + 1)[-2:]
-    pattern      = f"{year}-{target_short}"     # e.g. "2023-24"
+    # 🔍 DEBUG: show field names and available periods
+    log(f"[NSE-DEBUG] Report list keys: {list(data[0].keys())}", logs)
+    all_periods = [
+        f"fromYr={item.get('fromYr','?')} toYr={item.get('toYr','?')}"
+        for item in data[:10]
+    ]
+    log(f"[NSE-DEBUG] Available periods (first 10): {all_periods}", logs)
 
+    # NSE uses fromYr / toYr integer fields.
+    # User enters "2024" meaning FY 2023-24 → toYr == 2024
     for item in data:
-        period = str(
-            item.get("toDate") or item.get("fromDate") or
-            item.get("year")   or item.get("yearRange") or ""
-        )
-        pdf_url = item.get("fileName") or item.get("pdfLink") or item.get("url") or ""
+        from_yr  = str(item.get("fromYr") or "")
+        to_yr    = str(item.get("toYr")   or "")
+        pdf_url  = str(item.get("fileName") or "")
 
-        if pattern in period or str(year) in period:
+        log(f"[NSE-DEBUG] Entry: fromYr={from_yr} toYr={to_yr} file={pdf_url[:60]}", logs)
+
+        if to_yr == str(year) or from_yr == str(year):
+            log(f"[NSE] ✅ Matched: fromYr={from_yr} toYr={to_yr}", logs)
             if pdf_url:
                 full = pdf_url if pdf_url.startswith("http") else f"https://www.nseindia.com{pdf_url}"
-                log(f"[NSE] Found report URL for {pattern}", logs)
                 return full
+            else:
+                log(f"[NSE-DEBUG] Matched but fileName empty. Item: {item}", logs)
 
-    log(f"[NSE] ❌ No report found for {pattern} (checked {len(data)} entries)", logs)
+    log(f"[NSE] ❌ No report found for toYr={year} (checked {len(data)} entries)", logs)
     return None
 
 
